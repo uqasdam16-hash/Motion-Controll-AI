@@ -1,6 +1,7 @@
 """
 Motion Control AI - Telegram Bot
 Analisis pose manusia dari foto menggunakan MediaPipe + Claude AI
+Versi: tanpa OpenCV (pakai Pillow)
 """
 
 import os
@@ -10,9 +11,9 @@ import base64
 from pathlib import Path
 
 import anthropic
-import cv2
 import mediapipe as mp
 import numpy as np
+from PIL import Image, ImageDraw
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -23,457 +24,340 @@ from telegram.ext import (
     filters,
 )
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ── Konfigurasi ──────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_KEY_HERE")
-
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# ── Konfigurasi ───────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+anthropic_client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ── MediaPipe Setup ───────────────────────────────────────────────────────────
-mp_pose = mp.solutions.pose
+mp_pose    = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+
+# Warna skeleton (RGB)
+LANDMARK_COLOR   = (0, 255, 100)
+CONNECTION_COLOR = (0, 180, 255)
+DOT_RADIUS = 4
+LINE_WIDTH = 2
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def analyze_pose_landmarks(landmarks) -> dict:
-    """Ekstrak data landmark pose dan hitung sudut sendi utama."""
-    if not landmarks:
-        return {}
+def pil_to_rgb_array(img: Image.Image) -> np.ndarray:
+    return np.array(img.convert("RGB"))
 
+
+def angle_between(a, b, c) -> float:
+    ba = a - b
+    bc = c - b
+    cos_a = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-9)
+    return round(float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0)))), 1)
+
+
+def analyze_pose_landmarks(landmarks, w: int, h: int) -> dict:
     lm = landmarks.landmark
 
-    def get_coords(idx):
-        p = lm[idx]
-        return np.array([p.x, p.y, p.z])
-
-    def angle_between(a, b, c):
-        """Sudut di titik b (derajat)."""
-        ba = a - b
-        bc = c - b
-        cos_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-9)
-        return round(np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0))), 1)
-
-    # Landmark indices (MediaPipe Pose)
-    L_SHOULDER, R_SHOULDER = 11, 12
-    L_ELBOW,    R_ELBOW    = 13, 14
-    L_WRIST,    R_WRIST    = 15, 16
-    L_HIP,      R_HIP      = 23, 24
-    L_KNEE,     R_KNEE     = 25, 26
-    L_ANKLE,    R_ANKLE    = 27, 28
-    NOSE                   = 0
+    def pt(idx):
+        return np.array([lm[idx].x, lm[idx].y])
 
     try:
         data = {
-            "sudut_siku_kiri":   angle_between(get_coords(L_SHOULDER),  get_coords(L_ELBOW),  get_coords(L_WRIST)),
-            "sudut_siku_kanan":  angle_between(get_coords(R_SHOULDER),  get_coords(R_ELBOW),  get_coords(R_WRIST)),
-            "sudut_bahu_kiri":   angle_between(get_coords(L_HIP),       get_coords(L_SHOULDER), get_coords(L_ELBOW)),
-            "sudut_bahu_kanan":  angle_between(get_coords(R_HIP),       get_coords(R_SHOULDER), get_coords(R_ELBOW)),
-            "sudut_lutut_kiri":  angle_between(get_coords(L_HIP),       get_coords(L_KNEE),   get_coords(L_ANKLE)),
-            "sudut_lutut_kanan": angle_between(get_coords(R_HIP),       get_coords(R_KNEE),   get_coords(R_ANKLE)),
-            "sudut_pinggul_kiri":  angle_between(get_coords(L_SHOULDER), get_coords(L_HIP),   get_coords(L_KNEE)),
-            "sudut_pinggul_kanan": angle_between(get_coords(R_SHOULDER), get_coords(R_HIP),   get_coords(R_KNEE)),
+            "sudut_siku_kiri":      angle_between(pt(11), pt(13), pt(15)),
+            "sudut_siku_kanan":     angle_between(pt(12), pt(14), pt(16)),
+            "sudut_bahu_kiri":      angle_between(pt(23), pt(11), pt(13)),
+            "sudut_bahu_kanan":     angle_between(pt(24), pt(12), pt(14)),
+            "sudut_lutut_kiri":     angle_between(pt(23), pt(25), pt(27)),
+            "sudut_lutut_kanan":    angle_between(pt(24), pt(26), pt(28)),
+            "sudut_pinggul_kiri":   angle_between(pt(11), pt(23), pt(25)),
+            "sudut_pinggul_kanan":  angle_between(pt(12), pt(24), pt(26)),
         }
-
-        # Estimasi postur vertikal kepala-pinggul
-        nose_y    = lm[NOSE].y
-        hip_mid_y = (lm[L_HIP].y + lm[R_HIP].y) / 2
+        nose_y    = lm[0].y
+        hip_mid_y = (lm[23].y + lm[24].y) / 2
         data["postur_vertikal_persen"] = round((1 - abs(nose_y - hip_mid_y)) * 100, 1)
-
-        # Simetri bahu kiri-kanan
-        data["simetri_bahu_persen"] = round(
-            (1 - abs(lm[L_SHOULDER].y - lm[R_SHOULDER].y)) * 100, 1
-        )
-
+        data["simetri_bahu_persen"]    = round((1 - abs(lm[11].y - lm[12].y)) * 100, 1)
         return data
     except Exception as e:
-        logger.warning(f"Error saat ekstrak landmark: {e}")
+        logger.warning(f"Landmark error: {e}")
         return {}
 
 
-def draw_pose_on_image(image_path: str, output_path: str) -> bool:
-    """Gambar skeleton pose pada gambar dan simpan hasilnya."""
-    img = cv2.imread(image_path)
-    if img is None:
-        return False
+def draw_skeleton_pillow(img: Image.Image, landmarks) -> Image.Image:
+    """Gambar skeleton pose di atas gambar PIL tanpa OpenCV."""
+    w, h   = img.size
+    draw   = ImageDraw.Draw(img)
+    lm     = landmarks.landmark
 
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    def px(idx):
+        return (int(lm[idx].x * w), int(lm[idx].y * h))
 
-    with mp_pose.Pose(
-        static_image_mode=True,
-        model_complexity=2,
-        min_detection_confidence=0.5,
-    ) as pose:
-        results = pose.process(img_rgb)
-        if not results.pose_landmarks:
-            return False
+    # Gambar koneksi
+    for start_idx, end_idx in mp_pose.POSE_CONNECTIONS:
+        try:
+            x1, y1 = px(start_idx)
+            x2, y2 = px(end_idx)
+            draw.line([(x1, y1), (x2, y2)], fill=CONNECTION_COLOR, width=LINE_WIDTH)
+        except Exception:
+            pass
 
-        annotated = img.copy()
-        mp_drawing.draw_landmarks(
-            annotated,
-            results.pose_landmarks,
-            mp_pose.POSE_CONNECTIONS,
-            landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style(),
-        )
+    # Gambar titik landmark
+    for i in range(33):
+        try:
+            x, y = px(i)
+            draw.ellipse(
+                [(x - DOT_RADIUS, y - DOT_RADIUS), (x + DOT_RADIUS, y + DOT_RADIUS)],
+                fill=LANDMARK_COLOR,
+            )
+        except Exception:
+            pass
 
-        cv2.imwrite(output_path, annotated)
-        return True
+    return img
 
 
 def process_image_for_pose(image_path: str) -> tuple[dict, str | None]:
-    """
-    Proses gambar: deteksi pose & gambar skeleton.
-    Return (landmark_data, output_image_path).
-    """
-    output_path = image_path.replace(".jpg", "_pose.jpg").replace(".png", "_pose.png")
-    if output_path == image_path:
-        output_path = image_path + "_pose.jpg"
-
-    img = cv2.imread(image_path)
-    if img is None:
+    """Deteksi pose & gambar skeleton. Return (landmark_data, output_path)."""
+    try:
+        pil_img = Image.open(image_path).convert("RGB")
+    except Exception as e:
+        logger.error(f"Gagal buka gambar: {e}")
         return {}, None
 
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_array = pil_to_rgb_array(pil_img)
+    w, h      = pil_img.size
 
-    with mp_pose.Pose(
-        static_image_mode=True,
-        model_complexity=2,
-        min_detection_confidence=0.5,
-    ) as pose:
-        results = pose.process(img_rgb)
+    with mp_pose.Pose(static_image_mode=True, model_complexity=2, min_detection_confidence=0.5) as pose:
+        results = pose.process(img_array)
 
         if not results.pose_landmarks:
             return {}, None
 
-        # Gambar skeleton
-        annotated = img.copy()
-        mp_drawing.draw_landmarks(
-            annotated,
-            results.pose_landmarks,
-            mp_pose.POSE_CONNECTIONS,
-            landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style(),
-        )
-        cv2.imwrite(output_path, annotated)
+        landmark_data = analyze_pose_landmarks(results.pose_landmarks, w, h)
 
-        landmark_data = analyze_pose_landmarks(results.pose_landmarks)
+        # Gambar skeleton
+        skeleton_img = pil_img.copy()
+        skeleton_img = draw_skeleton_pillow(skeleton_img, results.pose_landmarks)
+
+        output_path = image_path + "_pose.jpg"
+        skeleton_img.save(output_path, "JPEG", quality=90)
+
         return landmark_data, output_path
 
 
 def ask_claude_analysis(image_path: str, landmark_data: dict, mode: str = "general") -> str:
-    """Kirim gambar + data landmark ke Claude untuk analisis mendalam."""
-
-    # Encode gambar ke base64
     with open(image_path, "rb") as f:
         img_b64 = base64.standard_b64encode(f.read()).decode("utf-8")
 
-    ext = Path(image_path).suffix.lower()
-    media_type = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
-
-    # Susun data landmark sebagai teks
     landmark_text = "\n".join(
-        f"- {k.replace('_', ' ').title()}: {v}°" if "sudut" in k
-        else f"- {k.replace('_', ' ').title()}: {v}%"
+        f"- {k.replace('_', ' ').title()}: {v}{'°' if 'sudut' in k else '%'}"
         for k, v in landmark_data.items()
     ) if landmark_data else "Data landmark tidak tersedia."
 
-    # Prompt berdasarkan mode
     mode_prompts = {
-        "general": "Analisis pose secara umum: postur tubuh, keseimbangan, dan kesan keseluruhan.",
-        "olahraga": "Analisis dari sudut pandang atletik: teknik, efisiensi gerakan, dan potensi cedera.",
-        "ergonomi": "Analisis ergonomi kerja: risiko MSDs, rekomendasi perbaikan postur.",
+        "general":   "Analisis pose secara umum: postur tubuh, keseimbangan, dan kesan keseluruhan.",
+        "olahraga":  "Analisis dari sudut pandang atletik: teknik, efisiensi gerakan, dan potensi cedera.",
+        "ergonomi":  "Analisis ergonomi kerja: risiko MSDs, rekomendasi perbaikan postur.",
         "kesehatan": "Analisis kesehatan postur: kelainan postur, kelengkungan tulang belakang, saran perbaikan.",
     }
-    focus = mode_prompts.get(mode, mode_prompts["general"])
 
-    prompt = f"""Kamu adalah ahli analisis biomekanik dan pose manusia. 
-Analisis gambar pose manusia berikut beserta data landmark yang telah diekstrak secara otomatis.
+    prompt = f"""Kamu adalah ahli analisis biomekanik dan pose manusia.
+Analisis gambar pose manusia berikut beserta data landmark yang telah diekstrak.
 
-DATA SUDUT SENDI (dari MediaPipe):
+DATA SUDUT SENDI (MediaPipe):
 {landmark_text}
 
-FOKUS ANALISIS: {focus}
+FOKUS ANALISIS: {mode_prompts.get(mode, mode_prompts['general'])}
 
-Berikan analisis dalam format berikut (gunakan emoji, buat mudah dibaca):
+Format respons (gunakan emoji):
 
 🏃 **RINGKASAN POSE**
-[Deskripsi singkat pose yang terdeteksi]
+[Deskripsi singkat pose]
 
 📐 **ANALISIS SENDI & SUDUT**
-[Interpretasi sudut-sudut sendi yang signifikan]
+[Interpretasi sudut-sudut signifikan]
 
 ⚠️ **POTENSI MASALAH**
-[Risiko atau ketidakseimbangan yang terdeteksi]
+[Risiko atau ketidakseimbangan]
 
 ✅ **REKOMENDASI**
-[Saran perbaikan atau latihan yang relevan]
+[Saran perbaikan atau latihan]
 
-📊 **SKOR POSTUR**
-[Berikan skor 0-100 dan penjelasannya]
+📊 **SKOR POSTUR: X/100**
+[Penjelasan skor]
 
-Gunakan Bahasa Indonesia yang jelas dan mudah dipahami."""
+Gunakan Bahasa Indonesia yang jelas."""
 
     response = anthropic_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1000,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": img_b64,
-                        },
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ],
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
     )
-
     return response.content[0].text
 
 
 # ── Telegram Handlers ─────────────────────────────────────────────────────────
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /start"""
-    text = (
+    await update.message.reply_text(
         "🤖 *Motion Control AI Bot*\n\n"
-        "Selamat datang! Bot ini menganalisis *pose manusia* dari foto menggunakan "
-        "MediaPipe + Claude AI.\n\n"
+        "Bot analisis *pose manusia* dari foto menggunakan MediaPipe \\+ Claude AI\\.\n\n"
         "📸 *Cara pakai:*\n"
-        "1\\. Kirim foto ke bot ini\n"
-        "2\\. Pilih jenis analisis\n"
-        "3\\. Dapatkan laporan detail pose\n\n"
-        "⚡ *Perintah tersedia:*\n"
-        "/start \\- Tampilkan pesan ini\n"
-        "/help \\- Panduan lengkap\n"
-        "/demo \\- Info mode analisis\n"
+        "1\\. Kirim foto\n"
+        "2\\. Pilih mode analisis\n"
+        "3\\. Terima laporan lengkap\\!\n\n"
+        "/help \\- Panduan lengkap",
+        parse_mode="MarkdownV2",
     )
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
 
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /help"""
-    text = (
-        "📖 *Panduan Motion Control AI Bot*\n\n"
+    await update.message.reply_text(
+        "📖 *Panduan Bot*\n\n"
         "*Mode Analisis:*\n"
-        "🔍 General \\- Analisis pose umum\n"
-        "🏋️ Olahraga \\- Teknik & performa atletik\n"
-        "💺 Ergonomi \\- Postur kerja & MSDs\n"
-        "🏥 Kesehatan \\- Kelainan postur & saran\n\n"
-        "*Tips foto terbaik:*\n"
-        "• Seluruh tubuh terlihat jelas\n"
+        "🔍 General \\- Pose umum\n"
+        "🏋️ Olahraga \\- Teknik & performa\n"
+        "💺 Ergonomi \\- Postur kerja\n"
+        "🏥 Kesehatan \\- Kelainan postur\n\n"
+        "*Tips foto:*\n"
+        "• Seluruh tubuh terlihat\n"
         "• Pencahayaan cukup\n"
-        "• Hindari pakaian longgar berlebihan\n"
-        "• Latar belakang kontras dengan tubuh\n\n"
-        "Cukup kirim foto dan pilih mode\\!"
+        "• Latar kontras dengan tubuh",
+        parse_mode="MarkdownV2",
     )
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
-
-
-async def demo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /demo"""
-    text = (
-        "🎯 *Mode Analisis yang Tersedia*\n\n"
-        "Setelah kirim foto, pilih salah satu:\n\n"
-        "🔍 *General* — Gambaran keseluruhan pose\n"
-        "🏋️ *Olahraga* — Analisis teknik & risiko cedera\n"
-        "💺 *Ergonomi* — Optimal untuk pekerja kantoran\n"
-        "🏥 *Kesehatan* — Deteksi kelainan postur\n\n"
-        "Kirim foto sekarang untuk mencoba\\!"
-    )
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler saat user kirim foto."""
-    await update.message.reply_text("📸 Foto diterima! Pilih mode analisis:")
-
-    keyboard = [
-        [
-            InlineKeyboardButton("🔍 General",   callback_data="mode_general"),
-            InlineKeyboardButton("🏋️ Olahraga",  callback_data="mode_olahraga"),
-        ],
-        [
-            InlineKeyboardButton("💺 Ergonomi",  callback_data="mode_ergonomi"),
-            InlineKeyboardButton("🏥 Kesehatan", callback_data="mode_kesehatan"),
-        ],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # Simpan file_id foto ke context user
-    photo = update.message.photo[-1]  # ambil resolusi tertinggi
+    photo = update.message.photo[-1]
     context.user_data["pending_photo_id"] = photo.file_id
 
+    keyboard = [
+        [InlineKeyboardButton("🔍 General",  callback_data="mode_general"),
+         InlineKeyboardButton("🏋️ Olahraga", callback_data="mode_olahraga")],
+        [InlineKeyboardButton("💺 Ergonomi", callback_data="mode_ergonomi"),
+         InlineKeyboardButton("🏥 Kesehatan",callback_data="mode_kesehatan")],
+    ]
     await update.message.reply_text(
-        "Pilih jenis analisis yang kamu inginkan:",
-        reply_markup=reply_markup,
+        "📸 Foto diterima! Pilih mode analisis:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
 async def mode_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler saat user memilih mode analisis."""
     query = update.callback_query
     await query.answer()
 
     mode = query.data.replace("mode_", "")
-    mode_labels = {
-        "general":   "🔍 General",
-        "olahraga":  "🏋️ Olahraga",
-        "ergonomi":  "💺 Ergonomi",
-        "kesehatan": "🏥 Kesehatan",
-    }
-    label = mode_labels.get(mode, mode)
+    labels = {"general": "🔍 General", "olahraga": "🏋️ Olahraga",
+              "ergonomi": "💺 Ergonomi", "kesehatan": "🏥 Kesehatan"}
+    label = labels.get(mode, mode)
 
-    await query.edit_message_text(f"⏳ Menganalisis pose dengan mode *{label}*...\nMohon tunggu sebentar.", parse_mode="Markdown")
+    await query.edit_message_text(f"⏳ Menganalisis dengan mode *{label}*...", parse_mode="Markdown")
 
     file_id = context.user_data.get("pending_photo_id")
     if not file_id:
-        await query.edit_message_text("❌ Foto tidak ditemukan. Silakan kirim ulang foto.")
+        await query.edit_message_text("❌ Foto tidak ditemukan. Kirim ulang foto.")
         return
 
+    tmp_path = pose_path = None
     try:
-        # Download foto
         file = await context.bot.get_file(file_id)
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             tmp_path = tmp.name
         await file.download_to_drive(tmp_path)
 
-        # Proses pose detection
         await query.edit_message_text("🦴 Mendeteksi landmark pose...")
-        landmark_data, pose_image_path = process_image_for_pose(tmp_path)
+        landmark_data, pose_path = process_image_for_pose(tmp_path)
 
         if not landmark_data:
             await query.edit_message_text(
                 "⚠️ *Pose tidak terdeteksi.*\n\n"
-                "Tips:\n"
-                "• Pastikan seluruh tubuh terlihat\n"
-                "• Gunakan foto dengan pencahayaan baik\n"
-                "• Hindari pose terlalu jauh dari kamera",
+                "Tips:\n• Pastikan seluruh tubuh terlihat\n"
+                "• Gunakan foto dengan pencahayaan baik",
                 parse_mode="Markdown",
             )
             return
 
-        # Analisis Claude AI
         await query.edit_message_text("🤖 Claude AI sedang menganalisis...")
         analysis = ask_claude_analysis(tmp_path, landmark_data, mode)
 
-        # Kirim gambar pose skeleton
-        if pose_image_path and Path(pose_image_path).exists():
-            with open(pose_image_path, "rb") as img_file:
+        # Kirim skeleton
+        if pose_path and Path(pose_path).exists():
+            with open(pose_path, "rb") as f:
                 await context.bot.send_photo(
                     chat_id=query.message.chat_id,
-                    photo=img_file,
-                    caption=f"🦴 Skeleton pose terdeteksi (mode: {label})",
+                    photo=f,
+                    caption=f"🦴 Skeleton pose (mode: {label})",
                 )
 
-        # Kirim analisis
-        # Telegram max 4096 chars per message
-        if len(analysis) > 4000:
-            for i in range(0, len(analysis), 4000):
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=analysis[i:i+4000],
-                )
-        else:
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=analysis,
-            )
+        # Kirim analisis (max 4096 char per pesan Telegram)
+        for i in range(0, len(analysis), 4000):
+            await context.bot.send_message(chat_id=query.message.chat_id, text=analysis[i:i+4000])
 
         # Tombol analisis ulang
-        keyboard = [[InlineKeyboardButton("🔄 Analisis Ulang dengan Mode Lain", callback_data="reanalyze")]]
         await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text="✅ Analisis selesai! Kirim foto lain atau pilih mode berbeda.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            text="✅ Selesai! Kirim foto lain atau pilih mode berbeda.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Analisis Ulang", callback_data="reanalyze")
+            ]]),
         )
-
         await query.edit_message_text(f"✅ Analisis mode *{label}* selesai!", parse_mode="Markdown")
 
     except Exception as e:
-        logger.error(f"Error saat analisis: {e}", exc_info=True)
-        await query.edit_message_text(
-            f"❌ Terjadi kesalahan: `{str(e)[:200]}`\n\nCoba kirim foto ulang.",
-            parse_mode="Markdown",
-        )
+        logger.error(f"Error analisis: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: `{str(e)[:200]}`\n\nCoba kirim foto ulang.", parse_mode="Markdown")
     finally:
-        # Cleanup temp files
-        for path in [tmp_path, pose_image_path if 'pose_image_path' in locals() else None]:
-            if path and Path(path).exists():
-                try:
-                    Path(path).unlink()
-                except Exception:
-                    pass
+        for p in [tmp_path, pose_path]:
+            if p and Path(p).exists():
+                try: Path(p).unlink()
+                except: pass
 
 
 async def reanalyze_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler tombol analisis ulang."""
     query = update.callback_query
     await query.answer()
-
     if not context.user_data.get("pending_photo_id"):
-        await query.edit_message_text("⚠️ Silakan kirim foto baru terlebih dahulu.")
+        await query.edit_message_text("⚠️ Silakan kirim foto baru.")
         return
-
     keyboard = [
-        [
-            InlineKeyboardButton("🔍 General",   callback_data="mode_general"),
-            InlineKeyboardButton("🏋️ Olahraga",  callback_data="mode_olahraga"),
-        ],
-        [
-            InlineKeyboardButton("💺 Ergonomi",  callback_data="mode_ergonomi"),
-            InlineKeyboardButton("🏥 Kesehatan", callback_data="mode_kesehatan"),
-        ],
+        [InlineKeyboardButton("🔍 General",  callback_data="mode_general"),
+         InlineKeyboardButton("🏋️ Olahraga", callback_data="mode_olahraga")],
+        [InlineKeyboardButton("💺 Ergonomi", callback_data="mode_ergonomi"),
+         InlineKeyboardButton("🏥 Kesehatan",callback_data="mode_kesehatan")],
     ]
-    await query.edit_message_text(
-        "Pilih mode analisis:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    await query.edit_message_text("Pilih mode analisis:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def unknown_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "❓ Perintah tidak dikenal. Gunakan /help untuk panduan.\n"
-        "Atau langsung kirim *foto* untuk dianalisis! 📸",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text("❓ Kirim /help atau langsung kirim *foto* untuk dianalisis! 📸", parse_mode="Markdown")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("⚠️  Set TELEGRAM_BOT_TOKEN di environment variable!")
-        print("   export TELEGRAM_BOT_TOKEN='token_kamu'")
-        print("   export ANTHROPIC_API_KEY='key_kamu'")
+    if not TELEGRAM_TOKEN:
+        print("⚠️  Set TELEGRAM_BOT_TOKEN di Railway → Variables!")
         return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Register handlers
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help",  help_handler))
-    app.add_handler(CommandHandler("demo",  demo_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    app.add_handler(CallbackQueryHandler(reanalyze_callback,   pattern="^reanalyze$"))
+    app.add_handler(CallbackQueryHandler(reanalyze_callback,    pattern="^reanalyze$"))
     app.add_handler(CallbackQueryHandler(mode_callback_handler, pattern="^mode_"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_handler))
 
     print("🤖 Motion Control AI Bot berjalan...")
-    print("   Tekan Ctrl+C untuk berhenti.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
