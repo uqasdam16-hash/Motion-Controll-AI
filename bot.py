@@ -22,7 +22,8 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
 )
-
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
