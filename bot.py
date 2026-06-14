@@ -1,4 +1,5 @@
 """
+# Motion Control AI Bot v2 - MediaPipe Tasks API
 Motion Control AI - Telegram Bot
 Analisis pose manusia dari foto menggunakan MediaPipe Tasks API + Claude AI
 Kompatibel dengan mediapipe >= 0.10.x (Python 3.13)
